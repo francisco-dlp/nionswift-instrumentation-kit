@@ -2501,7 +2501,7 @@ _component_unregistered_listener = None
 
 def run() -> None:
     def component_registered(component: Registry._ComponentType, component_types: typing.Set[str]) -> None:
-        if "scan_device" in component_types:
+        if "scan_device" in component_types and component.scan_device_id != "orsay_scan_device":
             stem_controller: typing.Optional[stem_controller_module.STEMController] = None
             stem_controller_id = getattr(component, "stem_controller_id", None)
             if not stem_controller and stem_controller_id:
@@ -2519,7 +2519,7 @@ def run() -> None:
             component.hardware_source = scan_hardware_source
 
     def component_unregistered(component: Registry._ComponentType, component_types: typing.Set[str]) -> None:
-        if "scan_device" in component_types:
+        if "scan_device" in component_types and component.scan_device_id != "orsay_scan_device":
             scan_hardware_source = component.hardware_source
             Registry.unregister_component(scan_hardware_source)
             HardwareSource.HardwareSourceManager().unregister_hardware_source(scan_hardware_source)
