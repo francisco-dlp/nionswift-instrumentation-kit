@@ -182,7 +182,7 @@ def get_slice_shape(slices: SliceType, shape: ShapeType) -> ShapeType:
 
 
 def expand_shape(shape: ShapeType) -> int:
-    return numpy.product(shape, dtype=numpy.int64)  # type: ignore
+    return int(numpy.product(shape, dtype=numpy.int64))  # type: ignore
 
 
 def get_slice_rect(slices: SliceType, shape: ShapeType) -> Geometry.IntRect:
@@ -543,6 +543,10 @@ class DataStream(ReferenceCounting.ReferenceCounted):
         Subclasses can override.
         """
         self.data_available_event.fire(data_stream_event)
+
+    def wrap_in_sequence(self, length: int) -> DataStream:
+        """Wrap this data stream in a sequence of length."""
+        return SequenceDataStream(self, length)
 
 
 class CollectedDataStream(DataStream):
@@ -1747,12 +1751,39 @@ class ContainerDataStream(DataStream):
         self.fire_data_available(data_stream_event)
 
 
+class ActionDataStreamDelegate:
+    """A delegate to perform the action.
+
+    Subclasses can override start, perform, and finish.
+    """
+    def start(self) -> None:
+        pass
+
+    def perform(self, c: ShapeType) -> None:
+        pass
+
+    def finish(self) -> None:
+        pass
+
+
+class ActionDataStreamFnDelegate(ActionDataStreamDelegate):
+    def __init__(self, fn: typing.Callable[[ShapeType], None]) -> None:
+        self.__fn = fn
+
+    def perform(self, c: ShapeType) -> None:
+        return self.__fn(c)
+
+
+def make_action_data_stream_delegate(fn: typing.Callable[[typing.Sequence[int]], None]) -> ActionDataStreamDelegate:
+    return ActionDataStreamFnDelegate(fn)
+
+
 class ActionDataStream(ContainerDataStream):
     """Action data stream. Runs action on each complete frame, passing coordinates."""
 
-    def __init__(self, data_stream: DataStream, fn: typing.Callable[[typing.Sequence[int]], None]) -> None:
+    def __init__(self, data_stream: DataStream, delegate: ActionDataStreamDelegate) -> None:
         super().__init__(data_stream)
-        self.__fn = fn
+        self.__delegate = delegate
         self.__shape = typing.cast(ShapeType, (0,))
         self.__index = 0
         self.__channel_count = len(self.channels)
@@ -1762,6 +1793,7 @@ class ActionDataStream(ContainerDataStream):
         self.__shape = stream_args.shape
         self.__index = 0
         self.__complete_channel_count = self.__channel_count
+        self.__delegate.start()
         self.__check_action()
         super()._start_stream(stream_args)
 
@@ -1769,13 +1801,17 @@ class ActionDataStream(ContainerDataStream):
         if not self.is_finished and not self.is_aborted:
             if self.__complete_channel_count == self.__channel_count:
                 c = better_unravel_index(self.__index, self.__shape)
-                self.__fn(c)
+                self.__delegate.perform(c)
                 self.__index += 1
                 self.__complete_channel_count = 0
 
     def _advance_stream(self) -> None:
         self.__check_action()
         super()._advance_stream()
+
+    def _finish_stream(self) -> None:
+        self.__delegate.finish()
+        super()._finish_stream()
 
     def _fire_data_available(self, data_stream_event: DataStreamEventArgs) -> None:
         super()._fire_data_available(data_stream_event)

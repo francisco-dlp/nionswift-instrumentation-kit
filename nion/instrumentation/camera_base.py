@@ -4,12 +4,14 @@ from __future__ import annotations
 import abc
 import asyncio
 import copy
+import dataclasses
 import datetime
 import gettext
 import json
 import logging
 import os
 import pathlib
+import time
 import typing
 import traceback
 import uuid
@@ -25,6 +27,7 @@ import numpy.typing
 from nion.data import Calibration
 from nion.data import Core
 from nion.data import DataAndMetadata
+from nion.instrumentation import Acquisition
 from nion.instrumentation import HardwareSource
 from nion.swift.model import ImportExportManager
 from nion.swift.model import Utility
@@ -331,7 +334,7 @@ class CameraDevice(typing.Protocol):
         The camera device can allocate memory to accommodate the scan_shape and begin acquisition immediately.
 
         The camera device will typically populate the PartialData with the data array (xdata), is_complete set to
-        False, is_canceled set to False, and valid_rows set to 0 or valid_row_range set to 0, 0.
+        False, is_canceled set to False, and valid_rows and valid_count set to 0.
 
         Returns PartialData.
         """
@@ -343,9 +346,13 @@ class CameraDevice(typing.Protocol):
         The camera device should wait up to update_period seconds for data and populate PartialData with data and
         information about the acquisition.
 
-        The valid_rows field of PartialData indicates how many rows are valid in xdata. The grab_synchronized method
-        will keep track of the last valid row and copy data from the last valid row to valid_rows into the acquisition
-        data and then update last valid row with valid_rows.
+        Deprecated: The valid_rows field of PartialData indicates how many rows are valid in xdata. The
+        grab_synchronized method will keep track of the last valid row and copy data from the last valid row to
+        valid_rows into the acquisition data and then update last valid row with valid_rows.
+
+        The valid_count field of PartialData indicates how many items are valid in xdata. The grab_synchronized method
+        will keep track of the last valid item and copy data from the last valid item to valid_count into the acquisition
+        data and then update last valid item with valid_count.
 
         The xdata field of PartialData must be filled with the data allocated during acquire_synchronized_begin. The
         section of data up to valid_rows must remain valid until the last Python reference to xdata is released.
@@ -382,6 +389,44 @@ class CameraDevice(typing.Protocol):
         Raise exception for error.
         """
         return None
+
+    def acquire_sequence_begin(self, camera_frame_parameters: CameraFrameParameters, count: int, **kwargs: typing.Any) -> PartialData:
+        """Begin sequence acquire.
+
+        The camera device can allocate memory to accommodate the count and begin acquisition immediately.
+
+        The camera device will typically populate the PartialData with the data array (xdata), is_complete set to
+        False, is_canceled set to False, and valid_rows and valid_count set to 0.
+
+        Returns PartialData.
+        """
+        pass
+
+    def acquire_sequence_continue(self, *, update_period: float = 1.0, **kwargs: typing.Any) -> PartialData:
+        """Continue sequence acquire.
+
+        The camera device should wait up to update_period seconds for data and populate PartialData with data and
+        information about the acquisition.
+
+        The valid_count field of PartialData indicates how many items are valid in xdata. The grab_synchronized method
+        will keep track of the last valid item and copy data from the last valid item to valid_count into the acquisition
+        data and then update last valid item with valid_count.
+
+        The xdata field of PartialData must be filled with the data allocated during acquire_synchronized_begin. The
+        section of data up to valid_rows must remain valid until the last Python reference to xdata is released.
+
+        Returns PartialData.
+        """
+        pass
+
+    def acquire_sequence_end(self, **kwargs: typing.Any) -> None:
+        """Clean up sequence acquire.
+
+        The camera device can clean up anything internal that was required for acquisition.
+
+        The memory returned during acquire_sequence_begin or acquire_sequence_continue must remain valid until
+        the last Python reference to that memory is released.
+        """
 
     def acquire_sequence_cancel(self) -> None:
         """Request to cancel a sequence acquisition.
@@ -568,7 +613,7 @@ class Mask:
             graphic = Graphics.factory(graphic_type_lookup)
             graphic.read_from_mime_data(graphic_dict)
             if graphic:
-                part_mask = graphic.get_mask(tuple(data_shape)).astype(bool)
+                part_mask = graphic.get_mask(tuple(data_shape)).astype(bool)  # type: ignore
                 if inverted:
                     part_mask = numpy.logical_not(part_mask)
                 if isinstance(value, (float, int)):
@@ -580,7 +625,7 @@ class Mask:
                     elif value == "grad_y":
                         value = [[0, 1], [0, 0]]
                     if hasattr(graphic, "center"):
-                        center = graphic.center
+                        center = getattr(graphic, "center")
                     else:
                         center = (0.5, 0.5)
                     center_coords = (center[0] * data_shape[0], center[1] * data_shape[1])
@@ -733,12 +778,23 @@ class CameraSettings:
 
 
 class PartialData:
+    """Represents data returned from acquisition.
+
+    The xdata should be the entire data array.
+
+    valid_count gives the number of valid pixels.
+
+    valid_rows is deprecated and does not need to be supplied if valid_count is supplied.
+
+    is_complete and is_canceled should be set as required.
+    """
     def __init__(self, xdata: DataAndMetadata.DataAndMetadata, is_complete: bool, is_canceled: bool,
-                 valid_rows: typing.Optional[int] = None):
+                 valid_rows: typing.Optional[int] = None, valid_count: typing.Optional[int] = None) -> None:
         self.xdata = xdata
         self.is_complete = is_complete
         self.is_canceled = is_canceled
         self.valid_rows = valid_rows
+        self.valid_count = valid_count
 
 
 @typing.runtime_checkable
@@ -765,6 +821,9 @@ class CameraHardwareSource(HardwareSource.HardwareSource, typing.Protocol):
     def acquire_synchronized(self, data_shape: DataAndMetadata.ShapeType, **kwargs: typing.Any) -> typing.Sequence[ImportExportManager.DataElementType]: ...
     def acquire_sequence_prepare(self, n: int) -> None: ...
     def acquire_sequence(self, n: int) -> typing.Sequence[ImportExportManager.DataElementType]: ...
+    def acquire_sequence_begin(self, camera_frame_parameters: CameraFrameParameters, count: int, **kwargs: typing.Any) -> PartialData: ...
+    def acquire_sequence_continue(self, *, update_period: float = 1.0) -> PartialData: ...
+    def acquire_sequence_end(self) -> None: ...
     def acquire_sequence_cancel(self) -> None: ...
 
     # properties
@@ -1180,6 +1239,23 @@ class CameraHardwareSource2(HardwareSource.ConcreteHardwareSource, CameraHardwar
         assert instrument_controller
         return build_calibration(instrument_controller, self.__camera.calibration_controls, "intensity")
 
+    def acquire_sequence_begin(self, camera_frame_parameters: CameraFrameParameters, count: int, **kwargs: typing.Any) -> PartialData:
+        acquire_sequence_begin = getattr(self.__camera, "acquire_sequence_begin", None)
+        if callable(acquire_sequence_begin):
+            return typing.cast(PartialData, acquire_sequence_begin(camera_frame_parameters, count, **kwargs))
+        raise NotImplementedError()
+
+    def acquire_sequence_continue(self, *, update_period: float = 1.0) -> PartialData:
+        acquire_sequence_continue = getattr(self.__camera, "acquire_sequence_continue", None)
+        if callable(acquire_sequence_continue):
+            return typing.cast(PartialData, acquire_sequence_continue())
+        raise NotImplementedError()
+
+    def acquire_sequence_end(self) -> None:
+        acquire_sequence_end = getattr(self.__camera, "acquire_sequence_end", None)
+        if callable(acquire_sequence_end):
+            acquire_sequence_end()
+
     def acquire_sequence_cancel(self) -> None:
         acquire_sequence_cancel = getattr(self.__camera, "acquire_sequence_cancel", None)
         if callable(acquire_sequence_cancel):
@@ -1364,6 +1440,351 @@ class CameraFrameParameters:
     @active_masks.setter
     def active_masks(self, value: typing.Union[typing.Sequence[Mask], typing.List[typing.Dict[str, typing.Any]]]) -> None:
         self.__active_masks = [Mask.from_dict(mask) if not isinstance(mask, Mask) else mask for mask in value]
+
+
+def crop_and_calibrate(uncropped_xdata: DataAndMetadata.DataAndMetadata, flyback_pixels: int,
+                       scan_calibrations: typing.Optional[DataAndMetadata.CalibrationListType],
+                       data_calibrations: DataAndMetadata.CalibrationListType,
+                       data_intensity_calibration: typing.Optional[Calibration.Calibration],
+                       metadata: DataAndMetadata.MetadataType) -> DataAndMetadata.DataAndMetadata:
+    data_shape = uncropped_xdata.data_shape
+    scan_shape = uncropped_xdata.collection_dimension_shape
+    scan_calibrations = scan_calibrations or uncropped_xdata.collection_dimensional_calibrations
+    uncropped_data = uncropped_xdata.data
+    assert uncropped_data is not None
+    if flyback_pixels > 0:
+        data = uncropped_data.reshape(*scan_shape, *data_shape[len(scan_shape):])[:, flyback_pixels:scan_shape[1], :]
+    else:
+        data = uncropped_data.reshape(*scan_shape, *data_shape[len(scan_shape):])
+    dimensional_calibrations = tuple(scan_calibrations) + tuple(data_calibrations)
+    return DataAndMetadata.new_data_and_metadata(data, data_intensity_calibration,
+                                                 dimensional_calibrations,
+                                                 dict(metadata), None,
+                                                 uncropped_xdata.data_descriptor, None,
+                                                 None)
+
+
+@dataclasses.dataclass
+class CameraDeviceStreamPartialData:
+    """Represents the data returned from get_next_data in the CameraDeviceStreamInterface."""
+    valid_index: int
+    is_complete: bool
+    xdata: DataAndMetadata.DataAndMetadata
+
+
+class CameraDeviceStreamInterface(typing.Protocol):
+    """An interface to a camera device to help implementation in a data stream."""
+
+    def prepare_stream(self, stream_args: Acquisition.DataStreamArgs, **kwargs: typing.Any) -> None: ...
+
+    def start_stream(self, stream_args: Acquisition.DataStreamArgs) -> None: ...
+
+    def finish_stream(self) -> None: ...
+
+    def abort_stream(self) -> None: ...
+
+    def get_next_data(self) -> typing.Optional[CameraDeviceStreamPartialData]:
+        """Return the partial data; return None if nothing is available."""
+        ...
+
+    def continue_data(self, partial_data: typing.Optional[CameraDeviceStreamPartialData]) -> None: ...
+
+
+class CameraDeviceSynchronizedStream(CameraDeviceStreamInterface):
+    """An interface using the 'synchronized' style methods of the camera."""
+    def __init__(self, camera_hardware_source: CameraHardwareSource, camera_frame_parameters: CameraFrameParameters, flyback_pixels: int = 0, additional_metadata: typing.Optional[DataAndMetadata.MetadataType] = None) -> None:
+        self.__camera_hardware_source = camera_hardware_source
+        self.__camera_frame_parameters = camera_frame_parameters
+        self.__additional_metadata = additional_metadata or dict()
+        self.__flyback_pixels = flyback_pixels
+        self.__partial_data_info = typing.cast(PartialData, None)
+        self.__slice: typing.List[slice] = list()
+
+    def prepare_stream(self, stream_args: Acquisition.DataStreamArgs, **kwargs: typing.Any) -> None:
+        camera_frame_parameters = self.__camera_frame_parameters
+        # clear the processing parameters in the original camera frame parameters.
+        # processing will be configured based on the operator kwarg instead.
+        camera_frame_parameters.processing = None
+        camera_frame_parameters.active_masks = list()
+        # get the operator.
+        operator = typing.cast(Acquisition.DataStreamOperator, kwargs.get("operator", Acquisition.NullDataStreamOperator()))
+        # rebuild the low level processing commands using the operator.
+        if isinstance(operator, Acquisition.SumOperator):
+            if operator.axis == 0:
+                camera_frame_parameters.processing = "sum_project"
+                operator.apply()
+            else:
+                camera_frame_parameters.processing = "sum_masked"
+                operator.apply()
+        elif isinstance(operator, Acquisition.StackedDataStreamOperator) and all(isinstance(o, Acquisition.SumOperator) for o in operator.operators):
+            camera_frame_parameters.processing = "sum_masked"
+            operator.apply()
+        elif isinstance(operator, Acquisition.StackedDataStreamOperator) and all(isinstance(o, Acquisition.MaskedSumOperator) for o in operator.operators):
+            camera_frame_parameters.processing = "sum_masked"
+            camera_frame_parameters.active_masks = [typing.cast(Mask, typing.cast(Acquisition.MaskedSumOperator, o).mask) for o in operator.operators]
+            operator.apply()
+        self.__camera_hardware_source.set_current_frame_parameters(camera_frame_parameters)
+        scan_shape = (stream_args.slice_rect.height, stream_args.slice_rect.width + self.__flyback_pixels)  # includes flyback pixels
+        self.__camera_hardware_source.acquire_synchronized_prepare(scan_shape)
+
+    def start_stream(self, stream_args: Acquisition.DataStreamArgs) -> None:
+        self.__slice = list(stream_args.slice)
+        scan_shape = (stream_args.slice_rect.height, stream_args.slice_rect.width + self.__flyback_pixels)  # includes flyback pixels
+        self.__partial_data_info = self.__camera_hardware_source.acquire_synchronized_begin(self.__camera_frame_parameters, scan_shape)
+
+    def finish_stream(self) -> None:
+        self.__camera_hardware_source.acquire_synchronized_end()
+
+    def abort_stream(self) -> None:
+        self.__camera_hardware_source.acquire_sequence_cancel()
+
+    def get_next_data(self) -> typing.Optional[CameraDeviceStreamPartialData]:
+        valid_rows = self.__partial_data_info.valid_rows
+        width = self.__slice[1].stop - self.__slice[1].start
+        valid_count = self.__partial_data_info.valid_count if self.__partial_data_info.valid_count is not None else valid_rows * (width + self.__flyback_pixels)
+        assert valid_count is not None
+        if valid_count > 0:
+            uncropped_xdata = self.__partial_data_info.xdata  # this returns the entire result data array
+            is_complete = self.__partial_data_info.is_complete
+            camera_metadata: typing.Dict[str, typing.Any] = dict()
+            self.__camera_hardware_source.update_camera_properties(camera_metadata, self.__camera_frame_parameters)
+            metadata = dict(copy.deepcopy(uncropped_xdata.metadata))
+            # this is a hack to prevent some of the potentially misleading metadata
+            # from getting saved into the synchronized data. while it is acceptable to
+            # assume that the hardware_source properties will get copied to the final
+            # metadata for now, camera implementers should be aware that this is likely
+            # to change behavior in the future. please write tests if you make this
+            # assumption so that they fail when this behavior is changed.
+            metadata.setdefault("hardware_source", dict()).pop("frame_number", None)
+            metadata.setdefault("hardware_source", dict()).pop("integration_count", None)
+            metadata.setdefault("hardware_source", dict()).pop("valid_rows", None)
+            metadata.setdefault("hardware_source", dict()).update(camera_metadata)
+            metadata.update(copy.deepcopy(self.__additional_metadata))
+
+            # TODO: this should be tracked elsewhere than here.
+            if "scan" in metadata:
+                metadata["scan"]["valid_rows"] = self.__slice[0].start + valid_count // (width + self.__flyback_pixels)
+
+            # note: collection calibrations will be added in the collections stream
+            data_calibrations = self.__camera_hardware_source.get_camera_calibrations(self.__camera_frame_parameters)
+            data_intensity_calibration = self.__camera_hardware_source.get_camera_intensity_calibration(self.__camera_frame_parameters)
+            cropped_xdata = crop_and_calibrate(uncropped_xdata, self.__flyback_pixels, None, data_calibrations, data_intensity_calibration, metadata)
+            # convert the valid count to valid index. valid count includes flyback pixels. valid index does not.
+            valid_index = valid_count // (width + self.__flyback_pixels) * width + max(0, valid_count % (width + self.__flyback_pixels) - self.__flyback_pixels)
+            return CameraDeviceStreamPartialData(valid_index, is_complete, cropped_xdata)
+        return None
+
+    def continue_data(self, partial_data: typing.Optional[CameraDeviceStreamPartialData]) -> None:
+        # acquire the next section and continue
+        if not partial_data or not partial_data.is_complete:
+            self.__partial_data_info = self.__camera_hardware_source.acquire_synchronized_continue()
+        else:
+            self.__partial_data_info = typing.cast(typing.Any, None)
+
+
+class CameraDeviceSequenceStream(CameraDeviceStreamInterface):
+    """An interface using the 'sequence' style methods of the camera."""
+    def __init__(self, camera_hardware_source: CameraHardwareSource, camera_frame_parameters: CameraFrameParameters, additional_metadata: typing.Optional[DataAndMetadata.MetadataType] = None) -> None:
+        self.__camera_hardware_source = camera_hardware_source
+        self.__camera_frame_parameters = camera_frame_parameters
+        self.__additional_metadata = additional_metadata or dict()
+        self.__partial_data_info = typing.cast(PartialData, None)
+        self.__slice: typing.List[slice] = list()
+
+    def prepare_stream(self, stream_args: Acquisition.DataStreamArgs, **kwargs: typing.Any) -> None:
+        camera_frame_parameters = self.__camera_frame_parameters
+        # clear the processing parameters in the original camera frame parameters.
+        # processing will be configured based on the operator kwarg instead.
+        camera_frame_parameters.processing = None
+        camera_frame_parameters.active_masks = list()
+        # get the operator.
+        operator = typing.cast(Acquisition.DataStreamOperator, kwargs.get("operator", Acquisition.NullDataStreamOperator()))
+        # rebuild the low level processing commands using the operator.
+        if isinstance(operator, Acquisition.SumOperator):
+            if operator.axis == 0:
+                camera_frame_parameters.processing = "sum_project"
+                operator.apply()
+            else:
+                camera_frame_parameters.processing = "sum_masked"
+                operator.apply()
+        elif isinstance(operator, Acquisition.StackedDataStreamOperator) and all(isinstance(o, Acquisition.SumOperator) for o in operator.operators):
+            camera_frame_parameters.processing = "sum_masked"
+            operator.apply()
+        elif isinstance(operator, Acquisition.StackedDataStreamOperator) and all(isinstance(o, Acquisition.MaskedSumOperator) for o in operator.operators):
+            camera_frame_parameters.processing = "sum_masked"
+            camera_frame_parameters.active_masks = [typing.cast(Mask, typing.cast(Acquisition.MaskedSumOperator, o).mask) for o in operator.operators]
+            operator.apply()
+        self.__camera_hardware_source.set_current_frame_parameters(camera_frame_parameters)
+        self.__camera_hardware_source.acquire_sequence_prepare(stream_args.sequence_count)
+
+    def start_stream(self, stream_args: Acquisition.DataStreamArgs) -> None:
+        self.__slice = list(stream_args.slice)
+        self.__partial_data_info = self.__camera_hardware_source.acquire_sequence_begin(self.__camera_frame_parameters, stream_args.sequence_count)
+
+    def finish_stream(self) -> None:
+        self.__camera_hardware_source.acquire_sequence_end()
+
+    def abort_stream(self) -> None:
+        self.__camera_hardware_source.acquire_sequence_cancel()
+
+    def get_next_data(self) -> typing.Optional[CameraDeviceStreamPartialData]:
+        valid_count = self.__partial_data_info.valid_count
+        assert valid_count is not None
+        if valid_count > 0:
+            uncropped_xdata = self.__partial_data_info.xdata  # this returns the entire result data array
+            is_complete = self.__partial_data_info.is_complete
+            camera_metadata: typing.Dict[str, typing.Any] = dict()
+            self.__camera_hardware_source.update_camera_properties(camera_metadata, self.__camera_frame_parameters)
+            metadata = dict(copy.deepcopy(uncropped_xdata.metadata))
+            # this is a hack to prevent some of the potentially misleading metadata
+            # from getting saved into the synchronized data. while it is acceptable to
+            # assume that the hardware_source properties will get copied to the final
+            # metadata for now, camera implementers should be aware that this is likely
+            # to change behavior in the future. please write tests if you make this
+            # assumption so that they fail when this behavior is changed.
+            metadata.setdefault("hardware_source", dict()).pop("frame_number", None)
+            metadata.setdefault("hardware_source", dict()).pop("integration_count", None)
+            metadata.setdefault("hardware_source", dict()).pop("valid_rows", None)
+            metadata.setdefault("hardware_source", dict()).update(camera_metadata)
+            metadata.update(copy.deepcopy(self.__additional_metadata))
+            # note: collection calibrations will be added in the collections stream
+            data_calibrations = self.__camera_hardware_source.get_camera_calibrations(self.__camera_frame_parameters)
+            data_intensity_calibration = self.__camera_hardware_source.get_camera_intensity_calibration(self.__camera_frame_parameters)
+            cropped_xdata = crop_and_calibrate(uncropped_xdata, 0, None, data_calibrations, data_intensity_calibration, metadata)
+            return CameraDeviceStreamPartialData(valid_count, is_complete, cropped_xdata)
+        return None
+
+    def continue_data(self, partial_data: typing.Optional[CameraDeviceStreamPartialData]) -> None:
+        # acquire the next section and continue
+        if not partial_data or not partial_data.is_complete:
+            self.__partial_data_info = self.__camera_hardware_source.acquire_sequence_continue()
+        else:
+            self.__partial_data_info = typing.cast(typing.Any, None)
+
+
+class CameraFramesDataStream(Acquisition.DataStream):
+    """A data stream of individual camera frames, for use in synchronized/sequence acquisition."""
+
+    def __init__(self, camera_hardware_source: CameraHardwareSource,
+                 camera_frame_parameters: CameraFrameParameters,
+                 camera_device_stream_delegate: CameraDeviceStreamInterface) -> None:
+        super().__init__()
+        self.__camera_device_stream_interface = camera_device_stream_delegate
+        self.__camera_hardware_source = camera_hardware_source
+        self.__camera_frame_parameters = camera_frame_parameters
+        self.__record_task = typing.cast(HardwareSource.RecordTask, None)  # used for single frames
+        self.__frame_shape = camera_hardware_source.get_expected_dimensions(camera_frame_parameters.binning)
+        self.__channel = Acquisition.Channel(self.__camera_hardware_source.hardware_source_id)
+        self.__last_index = 0
+        self.__camera_sequence_overheads: typing.List[float] = list()
+        self.camera_sequence_overhead = 0.0
+        self.__start = 0.0
+
+    def about_to_delete(self) -> None:
+        if self.__record_task:
+            self.__record_task = typing.cast(typing.Any, None)
+        super().about_to_delete()
+
+    @property
+    def channels(self) -> typing.Tuple[Acquisition.Channel, ...]:
+        return (self.__channel,)
+
+    def get_info(self, channel: Acquisition.Channel) -> Acquisition.DataStreamInfo:
+        data_shape = tuple(self.__camera_hardware_source.get_expected_dimensions(self.__camera_frame_parameters.binning))
+        data_metadata = DataAndMetadata.DataMetadata((data_shape, float))
+        return Acquisition.DataStreamInfo(data_metadata, self.__camera_frame_parameters.exposure_ms / 1000)
+
+    def _prepare_stream(self, stream_args: Acquisition.DataStreamArgs, **kwargs: typing.Any) -> None:
+        if stream_args.shape == (1,):
+            self.__camera_hardware_source.abort_playing(sync_timeout=5.0)
+        else:
+            self.__start = time.perf_counter()
+            self.__camera_device_stream_interface.prepare_stream(stream_args, **kwargs)
+            self.__camera_sequence_overheads.append(time.perf_counter() - self.__start)
+            while len(self.__camera_sequence_overheads) > 4:
+                self.__camera_sequence_overheads.pop(0)
+
+    def _start_stream(self, stream_args: Acquisition.DataStreamArgs) -> None:
+        if stream_args.shape == (1,):
+            self.__record_task = HardwareSource.RecordTask(self.__camera_hardware_source, self.__camera_frame_parameters)
+        else:
+            self.__last_index = 0
+            self.__start = time.perf_counter()
+            self.__camera_device_stream_interface.start_stream(stream_args)
+            self.__camera_sequence_overheads.append(time.perf_counter() - self.__start)
+            while len(self.__camera_sequence_overheads) > 4:
+                self.__camera_sequence_overheads.pop(0)
+            self.camera_sequence_overhead = sum(self.__camera_sequence_overheads) / (len(self.__camera_sequence_overheads) / 2)
+
+    def _finish_stream(self) -> None:
+        if self.__record_task:
+            self.__record_task = typing.cast(typing.Any, None)
+        else:
+            self.__camera_device_stream_interface.finish_stream()
+
+    def _abort_stream(self) -> None:
+        if self.__record_task:
+            self.__camera_hardware_source.abort_recording()
+        else:
+            self.__camera_device_stream_interface.abort_stream()
+
+    def _send_next(self) -> None:
+        if self.__record_task:
+            if self.__record_task.is_finished:
+                # data metadata describes the data being sent from this stream: shape, data type, and descriptor
+                data_descriptor = DataAndMetadata.DataDescriptor(False, 0, len(self.__frame_shape))
+                data_metadata = DataAndMetadata.DataMetadata((self.__frame_shape, numpy.float32), data_descriptor=data_descriptor)
+                source_data_slice: typing.Tuple[slice, ...] = (slice(0, self.__frame_shape[0]), slice(None))
+                state = Acquisition.DataStreamStateEnum.COMPLETE
+                xdatas = self.__record_task.grab()
+                xdata0 = xdatas[0] if xdatas else None
+                assert xdata0
+                data = xdata0.data
+                assert data is not None
+                data_stream_event = Acquisition.DataStreamEventArgs(self, self.__channel, data_metadata, data, None,
+                                                                    source_data_slice, state)
+                self.fire_data_available(data_stream_event)
+                self._sequence_next(self.__channel)
+        else:
+            partial_data = self.__camera_device_stream_interface.get_next_data()
+            if partial_data:
+                valid_index = partial_data.valid_index
+                is_complete = partial_data.is_complete
+                xdata = partial_data.xdata
+                start_index = self.__last_index
+                stop_index = valid_index
+                count = stop_index - start_index
+                if count > 0:
+                    data_channel_data = xdata.data
+                    assert data_channel_data is not None
+                    data_channel_data_metadata = xdata.data_metadata
+                    data_channel_data_dtype = data_channel_data_metadata.data_dtype
+                    assert data_channel_data_dtype is not None
+                    channel = Acquisition.Channel(self.__camera_hardware_source.hardware_source_id)
+                    data_metadata = DataAndMetadata.DataMetadata(
+                        (tuple(data_channel_data_metadata.datum_dimension_shape), data_channel_data_dtype),
+                        xdata.intensity_calibration,
+                        xdata.dimensional_calibrations[-len(data_channel_data_metadata.datum_dimension_shape):],
+                        xdata.metadata,
+                        xdata.timestamp,
+                        DataAndMetadata.DataDescriptor(False, 0, xdata.datum_dimension_count),
+                        xdata.timezone,
+                        xdata.timezone_offset)
+                    total_count = numpy.product(xdata.navigation_dimension_shape, dtype=numpy.int64)  # type: ignore
+                    data = data_channel_data.reshape((total_count,) + tuple(xdata.datum_dimension_shape))
+                    source_slice = (slice(start_index, stop_index),) + (slice(None),) * len(xdata.datum_dimension_shape)
+                    data_stream_state = Acquisition.DataStreamStateEnum.COMPLETE if is_complete else Acquisition.DataStreamStateEnum.PARTIAL
+                    data_stream_event = Acquisition.DataStreamEventArgs(self,
+                                                                        channel,
+                                                                        data_metadata,
+                                                                        data,
+                                                                        count,
+                                                                        source_slice,
+                                                                        data_stream_state)
+                    self.fire_data_available(data_stream_event)
+                    self._sequence_next(channel, count)
+                self.__last_index = valid_index
+            self.__camera_device_stream_interface.continue_data(partial_data)
 
 
 def get_instrument_calibration_value(instrument_controller: InstrumentController, calibration_controls: typing.Mapping[str, str], key: str) -> typing.Optional[typing.Union[float, str]]:
